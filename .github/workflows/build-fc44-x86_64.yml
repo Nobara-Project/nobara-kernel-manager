@@ -19,8 +19,8 @@ jobs:
       run: |
         mkdir -p SOURCES
         tar --exclude=.git --exclude=target --exclude=SOURCES \
-          --transform='s,^,nobara-kernel-manager-0.1.0/,' \
-          -czf SOURCES/nobara-kernel-manager-0.1.0.tar.gz .
+          --transform='s,^,nobara-kernel-manager-0.1.1/,' \
+          -czf SOURCES/nobara-kernel-manager-0.1.1.tar.gz .
 
     - name: Build RPM
       run: |

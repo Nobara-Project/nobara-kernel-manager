@@ -32,6 +32,10 @@ struct Controls {
     mainline: gtk::Button,
     lts: gtk::Button,
     rescue: gtk::Button,
+    booted_version: gtk::Label,
+    rescue_version: gtk::Label,
+    mainline_version: gtk::Label,
+    lts_version: gtk::Label,
     status: gtk::Label,
     detail: gtk::Label,
     spinner: gtk::Spinner,
@@ -100,6 +104,32 @@ fn build_ui(app: &adw::Application) {
         .margin_bottom(12)
         .build();
 
+    let booted_version = kernel_version_label();
+    let booted_row = adw::ActionRow::builder()
+        .title("Currently Booted Kernel")
+        .build();
+    booted_row.add_suffix(&booted_version);
+    let rescue_version = kernel_version_label();
+    let rescue_info_row = adw::ActionRow::builder()
+        .title("Installed Rescue Kernel")
+        .build();
+    rescue_info_row.add_suffix(&rescue_version);
+    let mainline_version = kernel_version_label();
+    let mainline_info_row = adw::ActionRow::builder()
+        .title("Latest Mainline Kernel")
+        .build();
+    mainline_info_row.add_suffix(&mainline_version);
+    let lts_version = kernel_version_label();
+    let lts_info_row = adw::ActionRow::builder().title("Latest LTS Kernel").build();
+    lts_info_row.add_suffix(&lts_version);
+    let information_group = adw::PreferencesGroup::builder()
+        .title("Kernel information")
+        .build();
+    information_group.add(&booted_row);
+    information_group.add(&rescue_info_row);
+    information_group.add(&mainline_info_row);
+    information_group.add(&lts_info_row);
+
     let mainline_button = gtk::Button::builder()
         .label("Switch to Mainline")
         .valign(gtk::Align::Center)
@@ -156,6 +186,7 @@ fn build_ui(app: &adw::Application) {
         .margin_end(24)
         .margin_bottom(24)
         .build();
+    groups.append(&information_group);
     groups.append(&kernel_group);
     groups.append(&rescue_group);
     let page = gtk::Box::builder()
@@ -180,7 +211,7 @@ fn build_ui(app: &adw::Application) {
         .title(APP_NAME)
         .icon_name(APP_ICON)
         .default_width(640)
-        .default_height(590)
+        .default_height(760)
         .content(&toolbar)
         .build();
 
@@ -188,6 +219,10 @@ fn build_ui(app: &adw::Application) {
         mainline: mainline_button,
         lts: lts_button,
         rescue: rescue_button,
+        booted_version,
+        rescue_version,
+        mainline_version,
+        lts_version,
         status,
         detail,
         spinner,
@@ -216,6 +251,16 @@ fn build_ui(app: &adw::Application) {
     ));
     refresh_state(&controls);
     window.present();
+}
+
+fn kernel_version_label() -> gtk::Label {
+    gtk::Label::builder()
+        .label("Checking…")
+        .selectable(true)
+        .halign(gtk::Align::End)
+        .ellipsize(gtk::pango::EllipsizeMode::Middle)
+        .max_width_chars(38)
+        .build()
 }
 
 fn run_action(
@@ -391,23 +436,80 @@ fn refresh_state(controls: &Controls) {
     controls.rescue.set_sensitive(true);
     controls.status.set_label("Checking installed kernels…");
     controls.detail.set_label("");
+    controls.booted_version.set_label(&booted_kernel_version());
+    controls.rescue_version.set_label("Checking…");
+    controls.mainline_version.set_label("Checking…");
+    controls.lts_version.set_label("Checking…");
     controls.spinner.set_spinning(true);
     controls.spinner.set_visible(true);
     let (sender, receiver) = async_channel::bounded(1);
     std::thread::spawn(move || {
-        let _ = sender.send_blocking(detect_kernel_state());
+        let result = read_boot_entries().map(|entries| {
+            let rescue =
+                rescue_kernel_version(&entries).unwrap_or_else(|| "Not installed".to_string());
+            (classify_entries(&entries), rescue)
+        });
+        let _ = sender.send_blocking(result);
     });
     glib::MainContext::default().spawn_local(glib::clone!(
         #[strong]
         controls,
         async move {
-            if let Ok(state) = receiver.recv().await {
+            if let Ok(result) = receiver.recv().await {
                 if !controls.busy.get() {
-                    apply_kernel_state(&controls, state);
+                    match result {
+                        Ok((state, rescue)) => {
+                            controls.rescue_version.set_label(&rescue);
+                            apply_kernel_state(&controls, state);
+                        }
+                        Err(error) => {
+                            controls.rescue_version.set_label("Unavailable");
+                            apply_kernel_state(&controls, KernelState::Unknown(error));
+                        }
+                    }
                 }
             }
         }
     ));
+    refresh_available_versions(controls);
+}
+
+fn refresh_available_versions(controls: &Controls) {
+    let (sender, receiver) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let mainline = std::thread::spawn(|| latest_kernel_version("nobara-kernel-mainline"));
+        let lts = std::thread::spawn(|| latest_kernel_version("nobara-kernel-lts"));
+        let mainline = mainline
+            .join()
+            .unwrap_or_else(|_| Err("Mainline version query failed".to_string()));
+        let lts = lts
+            .join()
+            .unwrap_or_else(|_| Err("LTS version query failed".to_string()));
+        let _ = sender.send_blocking((mainline, lts));
+    });
+    glib::MainContext::default().spawn_local(glib::clone!(
+        #[strong]
+        controls,
+        async move {
+            if let Ok((mainline, lts)) = receiver.recv().await {
+                apply_available_version(&controls.mainline_version, mainline);
+                apply_available_version(&controls.lts_version, lts);
+            }
+        }
+    ));
+}
+
+fn apply_available_version(label: &gtk::Label, result: Result<String, String>) {
+    match result {
+        Ok(version) => {
+            label.set_label(&version);
+            label.set_tooltip_text(None);
+        }
+        Err(error) => {
+            label.set_label("Unavailable");
+            label.set_tooltip_text(Some(&error));
+        }
+    }
 }
 
 fn apply_kernel_state(controls: &Controls, state: KernelState) {
@@ -469,11 +571,63 @@ fn disable_switch_buttons(controls: &Controls) {
     controls.lts.set_label("Unavailable");
 }
 
-fn detect_kernel_state() -> KernelState {
-    match read_boot_entries() {
-        Ok(entries) => classify_entries(&entries),
-        Err(error) => KernelState::Unknown(error),
+fn booted_kernel_version() -> String {
+    fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|version| version.trim().to_string())
+        .unwrap_or_else(|error| format!("Unavailable ({error})"))
+}
+
+fn rescue_kernel_version(entries: &[BootEntry]) -> Option<String> {
+    entries.iter().find_map(|entry| {
+        let title = entry.title.trim();
+        let is_rescue = title.to_lowercase().contains("rescue")
+            || entry.version.to_lowercase().contains("rescue");
+        if !is_rescue {
+            return None;
+        }
+
+        title
+            .strip_prefix("Nobara Linux Rescue Kernel (")
+            .and_then(|version| version.strip_suffix(')'))
+            .map(str::to_string)
+            .or_else(|| Some("Installed (version unknown)".to_string()))
+    })
+}
+
+fn latest_kernel_version(repo_id: &str) -> Result<String, String> {
+    let enabled_option = format!("--setopt={repo_id}.enabled=1");
+    let repo_option = format!("--repo={repo_id}");
+    let output = Command::new("dnf")
+        .args([
+            "-q",
+            "--setopt=reposdir=/etc/yum.repos.d,/etc/yum.repos.d/no-touch-disabled",
+            &enabled_option,
+            &repo_option,
+            "repoquery",
+            "--available",
+            "--latest-limit=1",
+            "--arch=x86_64",
+            "--queryformat=%{version}-%{release}.%{arch}\\n",
+            "kernel-core",
+        ])
+        .output()
+        .map_err(|error| format!("Could not start DNF: {error}"))?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if error.is_empty() {
+            format!("DNF could not query {repo_id}")
+        } else {
+            error
+        });
     }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let version = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .ok_or_else(|| format!("No kernel-core package is available from {repo_id}"))?;
+    Ok(version.to_string())
 }
 
 fn read_boot_entries() -> Result<Vec<BootEntry>, String> {
@@ -642,5 +796,17 @@ mod tests {
         .unwrap();
         assert_eq!(entry.title, "Nobara Linux");
         assert_eq!(entry.linux, "/vmlinuz-test");
+    }
+
+    #[test]
+    fn reads_rescue_kernel_version_from_title() {
+        let entries = vec![entry(
+            "Nobara Linux Rescue Kernel (7.2.0-202.nobara.fc44.x86_64)",
+            "0-rescue-machine-id",
+        )];
+        assert_eq!(
+            rescue_kernel_version(&entries),
+            Some("7.2.0-202.nobara.fc44.x86_64".to_string())
+        );
     }
 }

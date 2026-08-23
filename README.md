@@ -10,6 +10,8 @@ and remains licensed under MPL-2.0.
 
 - Reads Boot Loader Specification entries under `/boot/loader/entries` to
   identify installed kernel families.
+- Shows the booted kernel, installed rescue kernel, and the latest available
+  Mainline and LTS kernel versions.
 - Disables the button for the installed Nobara kernel family.
 - Disables both switching buttons when any third-party kernel entry is present.
 - Leaves **Reinstall Rescue Kernel** available regardless of kernel detection.

@@ -1,6 +1,6 @@
 Name:           nobara-kernel-manager
-Version:        0.1.0
-Release:        3%{?dist}
+Version:        0.1.1
+Release:        1%{?dist}
 Summary:        Graphical manager for Nobara Mainline, LTS, and rescue kernels
 License:        MPL-2.0
 URL:            https://github.com/nobara-project/nobara-kernel-manager
@@ -54,6 +54,9 @@ desktop-file-validate \
 %{_datadir}/polkit-1/actions/org.nobaraproject.kernel-manager.status.policy
 
 %changelog
+* Sun Aug 23 2026 Nobara Project <hello@nobaraproject.org> - 0.1.1-1
+- Show booted, rescue, latest Mainline, and latest LTS kernel versions
+
 * Sun Aug 23 2026 Nobara Project <hello@nobaraproject.org> - 0.1.0-3
 - Keep the live operation log scrolled to its newest output
 
