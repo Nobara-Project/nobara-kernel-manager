@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/software/polkit/policyconfig-1.dtd">
+<policyconfig>
+  <vendor>Nobara Project</vendor>
+  <vendor_url>https://nobaraproject.org/</vendor_url>
+
+  <action id="org.nobaraproject.kernel-manager.manage">
+    <description>Manage Nobara kernels</description>
+    <message>Authentication is required to modify installed kernels</message>
+    <icon_name>com.github.cosmicfusion.nobara-kernel-manager</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/nobara-kernel-manager/kernel-manager</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>

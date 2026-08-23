@@ -1,0 +1,24 @@
+.TH NOBARA-KERNEL-MANAGER 1 "August 2026" "Nobara Kernel Manager 0.1.0" "User Commands"
+.SH NAME
+nobara-kernel-manager \- manage Nobara Mainline, LTS, and rescue kernels
+.SH SYNOPSIS
+.B nobara-kernel-manager
+.SH DESCRIPTION
+.B Nobara Kernel Manager
+is a graphical utility for switching between the Nobara Mainline and LTS
+kernel families and rebuilding the rescue kernel.
+.PP
+Kernel-changing operations require administrator authentication. The kernel
+switch buttons are unavailable when a third-party kernel is present in GRUB.
+The rescue-kernel action remains available.
+.SH FILES
+.TP
+.I /usr/lib/nobara-kernel-manager/kernel-manager
+Privileged kernel-management backend.
+.TP
+.I /usr/lib/nobara-kernel-manager/kernel-status
+Read-only GRUB entry inspection helper.
+.SH SEE ALSO
+.BR dnf (8),
+.BR dracut (8),
+.BR grubby (8)

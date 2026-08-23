@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Nobara Kernel Manager
+Comment=Switch Nobara kernels and rebuild the rescue kernel
+Exec=nobara-kernel-manager
+Icon=com.github.cosmicfusion.nobara-kernel-manager
+Terminal=false
+Type=Application
+Categories=System;
+Keywords=kernel;mainline;lts;rescue;nobara;
+StartupNotify=true

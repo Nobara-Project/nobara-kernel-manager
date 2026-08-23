@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+    <gresource prefix="/com/github/cosmicfusion/nobara-kernel-manager/icons/scalable/actions/">
+        <file compressed="true" preprocess="xml-stripblanks">tux-symbolic.svg</file>
+    </gresource>
+</gresources>

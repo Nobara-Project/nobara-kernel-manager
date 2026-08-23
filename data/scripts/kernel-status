@@ -1,0 +1,33 @@
+#!/usr/bin/bash
+
+set -euo pipefail
+
+[[ $# -eq 0 ]] || {
+    printf 'Usage: %s\n' "${0##*/}" >&2
+    exit 2
+}
+
+readonly BLS_DIR=/boot/loader/entries
+[[ -d "$BLS_DIR" ]] || {
+    printf 'GRUB BLS entry directory not found: %s\n' "$BLS_DIR" >&2
+    exit 1
+}
+
+shopt -s nullglob
+entry_files=("$BLS_DIR"/*.conf)
+
+for entry_file in "${entry_files[@]}"; do
+    awk '
+        $1 == "title" && title == "" {
+            sub(/^[^[:space:]]+[[:space:]]+/, "")
+            title = $0
+        }
+        $1 == "version" && version == "" { version = $2 }
+        $1 == "linux" && linux == "" { linux = $2 }
+        END {
+            if (title != "" && version != "" && linux != "") {
+                printf "%s\t%s\t%s\n", title, version, linux
+            }
+        }
+    ' "$entry_file"
+done

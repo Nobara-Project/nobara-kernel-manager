@@ -1,0 +1,497 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+readonly REPO_DIR="/etc/yum.repos.d"
+readonly DISABLED_DIR="${REPO_DIR}/no-touch-disabled"
+readonly MAINLINE_FILE="nobara-kernel-mainline.repo"
+readonly LTS_FILE="nobara-kernel-lts.repo"
+
+readonly -a KERNEL_PACKAGES=(
+    kernel-modules
+    kernel-core
+    kernel-devel
+    kernel-devel-matched
+    kernel-headers
+    kernel
+)
+
+usage() {
+    printf 'Usage:\n' >&2
+    printf '  %s switch {mainline|lts}\n' "${0##*/}" >&2
+    printf '  %s rescue reinstall\n' "${0##*/}" >&2
+}
+
+die() {
+    printf 'Error: %s\n' "$*" >&2
+    exit 1
+}
+
+repo_file_location() {
+    local filename=$1
+    local active_path="${REPO_DIR}/${filename}"
+    local disabled_path="${DISABLED_DIR}/${filename}"
+
+    if [[ -e "$active_path" && -e "$disabled_path" ]]; then
+        die "${filename} exists in both repository directories"
+    elif [[ -f "$active_path" ]]; then
+        printf '%s\n' "$active_path"
+    elif [[ -f "$disabled_path" ]]; then
+        printf '%s\n' "$disabled_path"
+    else
+        die "cannot find ${filename}"
+    fi
+}
+
+set_repo_enabled() {
+    local path=$1
+    local value=$2
+    local enabled_lines
+
+    enabled_lines=$(grep -Ec '^[[:space:]]*enabled[[:space:]]*=' "$path" || true)
+    [[ "$enabled_lines" -eq 1 ]] ||
+        die "expected exactly one enabled= setting in ${path}"
+
+    sudo sed -i -E \
+        "s/^[[:space:]]*enabled[[:space:]]*=.*/enabled=${value}/" "$path"
+}
+
+repo_is_enabled() {
+    local path=$1
+
+    [[ -f "$path" ]] &&
+        grep -Eq '^[[:space:]]*enabled[[:space:]]*=[[:space:]]*1([[:space:]]*(#.*)?)?$' "$path"
+}
+
+enabled_kernel_family() {
+    local mainline_enabled=0
+    local lts_enabled=0
+
+    repo_is_enabled "${REPO_DIR}/${MAINLINE_FILE}" && mainline_enabled=1
+    repo_is_enabled "${REPO_DIR}/${LTS_FILE}" && lts_enabled=1
+
+    if ((mainline_enabled && !lts_enabled)); then
+        printf 'mainline\n'
+    elif ((lts_enabled && !mainline_enabled)); then
+        printf 'lts\n'
+    fi
+}
+
+select_rescue_kernel() {
+    local machine_id=$1
+    local family
+    local entry
+    local version
+    local newest
+    local -a usable_versions=()
+    local -a family_versions=()
+
+    family=$(enabled_kernel_family)
+
+    for entry in "/boot/loader/entries/${machine_id}-"*.conf; do
+        [[ -f "$entry" ]] || continue
+
+        version=${entry##*/}
+        version=${version#"${machine_id}-"}
+        version=${version%.conf}
+        [[ $version != 0-rescue* ]] || continue
+        [[ -f "/usr/lib/modules/${version}/vmlinuz" ]] || continue
+
+        usable_versions+=("$version")
+        case "$family:$version" in
+            lts:*.lts.nobara.*)
+                family_versions+=("$version")
+                ;;
+            mainline:*.nobara.*)
+                [[ $version == *.lts.nobara.* ]] ||
+                    family_versions+=("$version")
+                ;;
+        esac
+    done
+
+    if [[ -n $family ]]; then
+        ((${#family_versions[@]})) ||
+            die "no bootable ${family} kernel entry is available for rescue reinstall"
+        newest=$(printf '%s\n' "${family_versions[@]}" | sort -V | tail -n 1)
+        printf 'Using the newest bootable %s kernel for rescue: %s\n' \
+            "$family" "$newest" >&2
+    else
+        ((${#usable_versions[@]})) ||
+            die "no bootable kernel entry is available for rescue reinstall"
+        newest=$(printf '%s\n' "${usable_versions[@]}" | sort -V | tail -n 1)
+        printf 'Could not identify one enabled Nobara kernel source; using the newest bootable kernel: %s\n' \
+            "$newest" >&2
+    fi
+
+    printf '%s\n' "$newest"
+}
+
+reinstall_rescue_kernel() {
+    local command_name
+    local kernel_version
+    local kernel_image
+    local machine_id
+    local rescue_id
+    local normal_entry
+    local rescue_entry
+    local rescue_kernel
+    local rescue_initramfs
+    local rescue_kernel_tmp=""
+    local rescue_initramfs_tmp=""
+    local rescue_entry_tmp=""
+    local entry_workfile=""
+    local external_dir
+    local module_path
+    local module_name
+    local module_file
+    local omit_drivers=""
+    local blacklist_csv=""
+    local initramfs_listing
+    local -a external_module_names=()
+    local -a external_module_files=()
+    local -a dracut_args=()
+    local -A seen_module_names=()
+    local -A seen_module_files=()
+
+    for command_name in awk dracut find grep install lsinitrd mktemp \
+        modinfo mv restorecon sort sudo tail update-grub; do
+        command -v "$command_name" >/dev/null 2>&1 ||
+            die "required command not found: ${command_name}"
+    done
+
+    machine_id=$(< /etc/machine-id)
+    [[ $machine_id =~ ^[[:xdigit:]]{32}$ ]] ||
+        die "invalid machine ID in /etc/machine-id"
+
+    kernel_version=$(select_rescue_kernel "$machine_id")
+    kernel_image="/usr/lib/modules/${kernel_version}/vmlinuz"
+
+    rescue_id="0-rescue-${machine_id}"
+    normal_entry="/boot/loader/entries/${machine_id}-${kernel_version}.conf"
+    rescue_entry="/boot/loader/entries/${machine_id}-0-rescue.conf"
+    rescue_kernel="/boot/vmlinuz-${rescue_id}"
+    rescue_initramfs="/boot/initramfs-${rescue_id}.img"
+
+    sudo -v
+    sudo test -f "$normal_entry" ||
+        die "normal boot entry not found: ${normal_entry}"
+
+    # Treat modules in the conventional out-of-tree locations as external.
+    # Both DKMS and packaged kmods normally install into one of these trees.
+    for external_dir in \
+        "/usr/lib/modules/${kernel_version}/extra" \
+        "/usr/lib/modules/${kernel_version}/updates" \
+        "/usr/lib/modules/${kernel_version}/weak-updates"; do
+        [[ -d "$external_dir" ]] || continue
+
+        while IFS= read -r module_path; do
+            module_name=$(modinfo -F name "$module_path" 2>/dev/null || true)
+            [[ -n "$module_name" ]] ||
+                die "could not determine module name for ${module_path}"
+
+            module_file=${module_path##*/}
+            module_file=${module_file%.zst}
+            module_file=${module_file%.xz}
+            module_file=${module_file%.gz}
+
+            if [[ -z ${seen_module_names[$module_name]+set} ]]; then
+                external_module_names+=("$module_name")
+                seen_module_names[$module_name]=1
+            fi
+            if [[ -z ${seen_module_files[$module_file]+set} ]]; then
+                external_module_files+=("$module_file")
+                seen_module_files[$module_file]=1
+            fi
+        done < <(find -L "$external_dir" -type f \
+            \( -name '*.ko' -o -name '*.ko.zst' -o \
+            -name '*.ko.xz' -o -name '*.ko.gz' \) -print)
+    done
+
+    if ((${#external_module_names[@]})); then
+        omit_drivers=${external_module_names[*]}
+        blacklist_csv=$(IFS=,; printf '%s' "${external_module_names[*]}")
+        printf 'Excluding external kernel modules from rescue boot:\n'
+        printf '  %s\n' "${external_module_names[@]}"
+    else
+        printf 'No external DKMS/kmod modules were found for %s.\n' \
+            "$kernel_version"
+    fi
+
+    rescue_kernel_tmp=$(sudo mktemp \
+        --tmpdir=/boot .kernel-manager-rescue-kernel.XXXXXX)
+    rescue_initramfs_tmp=$(sudo mktemp \
+        --tmpdir=/boot .kernel-manager-rescue-initramfs.XXXXXX)
+    rescue_entry_tmp=$(sudo mktemp \
+        --tmpdir=/boot/loader/entries .kernel-manager-rescue-entry.XXXXXX)
+    entry_workfile=$(mktemp /tmp/kernel-manager-rescue-entry.XXXXXX)
+
+    cleanup_rescue_staging() {
+        [[ -z $rescue_kernel_tmp ]] || sudo rm -f -- "$rescue_kernel_tmp"
+        [[ -z $rescue_initramfs_tmp ]] || sudo rm -f -- "$rescue_initramfs_tmp"
+        [[ -z $rescue_entry_tmp ]] || sudo rm -f -- "$rescue_entry_tmp"
+        [[ -z $entry_workfile ]] || rm -f -- "$entry_workfile"
+    }
+    trap cleanup_rescue_staging EXIT
+
+    sudo install -m 0755 "$kernel_image" "$rescue_kernel_tmp"
+
+    dracut_args=(
+        --force
+        --hostonly
+        --hostonly-mode strict
+        --no-uefi
+        --add rescue
+        --kver "$kernel_version"
+    )
+    if [[ -n $omit_drivers ]]; then
+        dracut_args+=(--omit-drivers "$omit_drivers")
+    fi
+
+    printf 'Building a strict host-only rescue initramfs for %s.\n' \
+        "$kernel_version"
+    sudo dracut "${dracut_args[@]}" "$rescue_initramfs_tmp"
+
+    initramfs_listing=$(sudo lsinitrd "$rescue_initramfs_tmp")
+    for module_file in "${external_module_files[@]}"; do
+        if grep -Fq "/${module_file}" <<<"$initramfs_listing"; then
+            die "external module ${module_file} was included in the rescue initramfs"
+        fi
+    done
+
+    # Clone the working kernel's known-good BLS entry. The rescue version starts
+    # with 0 so GRUB sorts it below every normal versioned kernel entry.
+    # The unprivileged shell intentionally writes awk's output to our private
+    # work file; sudo is needed only to read the protected BLS source entry.
+    # shellcheck disable=SC2024
+    sudo awk \
+        -v rescue_id="$rescue_id" \
+        -v kernel_version="$kernel_version" \
+        -v blacklist="$blacklist_csv" '
+        $1 == "title" {
+            print "title Nobara Linux Rescue Kernel (" kernel_version ")"
+            next
+        }
+        $1 == "version" {
+            print "version " rescue_id
+            next
+        }
+        $1 == "linux" {
+            path = $2
+            sub(/[^/]+$/, "vmlinuz-" rescue_id, path)
+            print "linux " path
+            next
+        }
+        $1 == "initrd" {
+            path = $2
+            sub(/[^/]+$/, "initramfs-" rescue_id ".img", path)
+            print "initrd " path
+            next
+        }
+        $1 == "options" {
+            printf "options"
+            for (i = 2; i <= NF; i++) {
+                if ($i != "nomodeset" && \
+                    $i !~ /^(rd[.]driver[.]blacklist|module_blacklist)=/) {
+                    printf " %s", $i
+                }
+            }
+            printf " nomodeset"
+            if (blacklist != "") {
+                printf " rd.driver.blacklist=%s module_blacklist=%s", \
+                    blacklist, blacklist
+            }
+            printf "\n"
+            next
+        }
+        { print }
+    ' "$normal_entry" >"$entry_workfile"
+
+    grep -Fqx "version ${rescue_id}" "$entry_workfile" ||
+        die "failed to create the rescue entry version"
+    grep -Fqx "title Nobara Linux Rescue Kernel (${kernel_version})" \
+        "$entry_workfile" || die "failed to create the rescue entry title"
+    grep -Eq "^linux[[:space:]]+.*/?vmlinuz-${rescue_id}$" \
+        "$entry_workfile" || die "failed to create the rescue kernel path"
+    grep -Eq "^initrd[[:space:]]+.*/?initramfs-${rescue_id}[.]img$" \
+        "$entry_workfile" || die "failed to create the rescue initramfs path"
+    grep -Eq '^options[[:space:]].*(^|[[:space:]])nomodeset([[:space:]]|$)' \
+        "$entry_workfile" || die "failed to enable rescue basic graphics mode"
+
+    sudo install -m 0600 "$entry_workfile" "$rescue_entry_tmp"
+
+    # All staged files are complete and validated before replacing the old set.
+    sudo mv -f "$rescue_kernel_tmp" "$rescue_kernel"
+    rescue_kernel_tmp=""
+    sudo mv -f "$rescue_initramfs_tmp" "$rescue_initramfs"
+    rescue_initramfs_tmp=""
+    sudo mv -f "$rescue_entry_tmp" "$rescue_entry"
+    rescue_entry_tmp=""
+
+    sudo restorecon -F "$rescue_kernel" "$rescue_initramfs" "$rescue_entry"
+    sudo update-grub
+
+    trap - EXIT
+    cleanup_rescue_staging
+
+    printf 'Rescue kernel %s was reinstalled successfully.\n' "$kernel_version"
+    printf 'Its GRUB version is %s so it remains last in the kernel list.\n' \
+        "$rescue_id"
+}
+
+[[ $# -eq 2 ]] || {
+    usage
+    exit 2
+}
+
+action=$1
+kernel_flavor=$2
+
+case "${action}:${kernel_flavor}" in
+    switch:mainline)
+        enabled_repo_id="nobara-kernel-mainline"
+        enabled_filename=$MAINLINE_FILE
+        disabled_repo_id="nobara-kernel-lts"
+        disabled_filename=$LTS_FILE
+        ;;
+    switch:lts)
+        enabled_repo_id="nobara-kernel-lts"
+        enabled_filename=$LTS_FILE
+        disabled_repo_id="nobara-kernel-mainline"
+        disabled_filename=$MAINLINE_FILE
+        ;;
+    rescue:reinstall)
+        reinstall_rescue_kernel
+        exit 0
+        ;;
+    *)
+        usage
+        exit 2
+        ;;
+esac
+
+for command_name in dnf rpm sudo sed grep dracut update-grub; do
+    command -v "$command_name" >/dev/null 2>&1 ||
+        die "required command not found: ${command_name}"
+done
+
+enabled_source=$(repo_file_location "$enabled_filename")
+disabled_source=$(repo_file_location "$disabled_filename")
+
+grep -Fqx "[${enabled_repo_id}]" "$enabled_source" ||
+    die "${enabled_source} does not define [${enabled_repo_id}]"
+grep -Fqx "[${disabled_repo_id}]" "$disabled_source" ||
+    die "${disabled_source} does not define [${disabled_repo_id}]"
+
+# Cache the exact installed NEVRAs before changing the repo-file layout.
+if ! installed_output=$(dnf -q repoquery \
+    --installed \
+    --installed-from-repo="$disabled_repo_id" \
+    --queryformat='%{full_nevra}\n'); then
+    die "DNF could not query packages installed from ${disabled_repo_id}"
+fi
+
+disabled_packages=()
+if [[ -n "$installed_output" ]]; then
+    mapfile -t disabled_packages <<<"$installed_output"
+fi
+
+sudo -v
+sudo install -d -m 0755 "$DISABLED_DIR"
+
+# Change enabled= while each file is still at its known source path. The repo
+# being retired is disabled before its replacement is made visible to DNF.
+set_repo_enabled "$disabled_source" 0
+set_repo_enabled "$enabled_source" 1
+
+disabled_destination="${DISABLED_DIR}/${disabled_filename}"
+enabled_destination="${REPO_DIR}/${enabled_filename}"
+
+if [[ "$disabled_source" != "$disabled_destination" ]]; then
+    sudo mv "$disabled_source" "$disabled_destination"
+fi
+if [[ "$enabled_source" != "$enabled_destination" ]]; then
+    sudo mv "$enabled_source" "$enabled_destination"
+fi
+
+printf 'Selected the %s kernel and disabled the %s kernel source.\n' \
+    "$kernel_flavor" \
+    "$([[ $kernel_flavor == mainline ]] && printf lts || printf mainline)"
+
+# Confirm that the selected source is usable and contains every managed package
+# before removing any installed kernel packages.
+sudo dnf -y --refresh --repo="$enabled_repo_id" makecache
+
+for package_name in "${KERNEL_PACKAGES[@]}"; do
+    if ! available_output=$(sudo dnf -q --repo="$enabled_repo_id" repoquery \
+        --available \
+        --latest-limit=1 \
+        --queryformat='%{full_nevra}\n' \
+        "$package_name") || [[ -z "$available_output" ]]; then
+        die "${package_name} is not available from ${enabled_repo_id}"
+    fi
+done
+
+if ((${#disabled_packages[@]})); then
+    printf 'Removing packages installed from %s:\n' "$disabled_repo_id"
+    for package_nevra in "${disabled_packages[@]}"; do
+        printf '  %s\n' "$package_nevra"
+        sudo rpm -e --nodeps "$package_nevra"
+    done
+else
+    printf 'No installed packages were attributed to %s.\n' "$disabled_repo_id"
+fi
+
+# Remove every installed version of each managed package for both switch
+# directions. Querying by name also catches packages recorded as @commandline.
+printf 'Purging all previously installed managed kernel packages.\n'
+
+for package_name in "${KERNEL_PACKAGES[@]}"; do
+    installed_nevras=()
+    if package_output=$(sudo rpm -q \
+        --qf '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' \
+        "$package_name" 2>/dev/null); then
+        mapfile -t installed_nevras <<<"$package_output"
+    fi
+
+    for package_nevra in "${installed_nevras[@]}"; do
+        printf '  %s\n' "$package_nevra"
+        sudo rpm -e --nodeps "$package_nevra"
+    done
+done
+
+for package_name in "${KERNEL_PACKAGES[@]}"; do
+    if sudo rpm -q "$package_name" >/dev/null 2>&1; then
+        die "${package_name} is still installed after the kernel purge"
+    fi
+done
+
+for package_name in "${KERNEL_PACKAGES[@]}"; do
+    if sudo rpm -q "$package_name" >/dev/null 2>&1; then
+        printf 'Upgrading installed package %s from %s.\n' \
+            "$package_name" "$enabled_repo_id"
+        sudo dnf -y --best upgrade \
+            --from-repo="$enabled_repo_id" "$package_name"
+    else
+        printf 'Installing missing package %s from %s.\n' \
+            "$package_name" "$enabled_repo_id"
+        sudo dnf -y --best install \
+            --from-repo="$enabled_repo_id" "$package_name"
+    fi
+done
+
+for package_name in "${KERNEL_PACKAGES[@]}"; do
+    installed_nevras=()
+    if package_output=$(sudo rpm -q \
+        --qf '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' \
+        "$package_name" 2>/dev/null); then
+        mapfile -t installed_nevras <<<"$package_output"
+    fi
+
+    [[ ${#installed_nevras[@]} -eq 1 ]] ||
+        die "expected exactly one installed version of ${package_name}, found ${#installed_nevras[@]}"
+done
+
+sudo dracut -f --regenerate-all
+sudo update-grub
+
+printf 'Kernel switch to %s completed successfully.\n' "$kernel_flavor"
