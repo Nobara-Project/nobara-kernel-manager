@@ -19,7 +19,12 @@ and remains licensed under MPL-2.0.
   `kernel-manager` backend.
 
 Switching removes all installed versions of the managed kernel packages before
-installing the latest packages from the selected Nobara kernel source. Rescue
+installing the latest packages from the selected Nobara kernel source. The removal
+plan includes generated per-kernel module RPMs whose exact kernel is being
+retired, including locally built akmods packages. Driver sources, generic module
+packages, and modules whose kernel still has an installed provider are retained.
+All RPM inventory checks finish before any package is erased. DNF operations use
+DNF5 explicitly. Rescue
 reinstallation uses the newest bootable kernel matching the enabled Nobara
 kernel source, builds a strict host-only initramfs, excludes external modules,
 uses basic graphics mode, and keeps the rescue entry last in GRUB.
@@ -43,3 +48,14 @@ kernel-manager switch mainline
 kernel-manager switch lts
 kernel-manager rescue reinstall
 ```
+
+## Backend regression tests
+
+```bash
+python3 -B -m unittest discover -s tests -v
+```
+
+The tests run the switch script with disposable repository files and simulated
+RPM/DNF commands. They cover both switch directions, exact module matching,
+retained kernel providers, and failures before removal; host packages and boot
+files are never changed.

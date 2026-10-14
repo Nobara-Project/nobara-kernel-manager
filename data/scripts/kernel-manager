@@ -338,6 +338,74 @@ reinstall_rescue_kernel() {
         "$rescue_id"
 }
 
+# Build one exact removal set before erasing anything. Generated akmods RPMs
+# have @commandline origins, so repository history alone cannot identify them.
+plan_kernel_removals() {
+    local inventory package_name package_nevra provides dependency kernel_version
+    local providers provider requirements managed candidate
+    local -a kernel_removals=()
+    local -A retired=() retired_kernels=() repository_packages=()
+
+    for package_nevra in "${disabled_packages[@]}"; do
+        repository_packages["$package_nevra"]=1
+    done
+    inventory=$(sudo rpm -qa --qf '%{NAME}\t%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n') ||
+        die "could not read the installed RPM inventory"
+    while IFS=$'\t' read -r package_name package_nevra; do
+        [[ -n $package_name && -n $package_nevra ]] || continue
+        # A package's repository must never authorize removing driver sources
+        # (akmod-*, broadcom-wl, etc.) or unrelated userspace packages.
+        case "$package_name" in kernel|kernel-*) ;; *) continue ;; esac
+        candidate=0
+        [[ -z ${repository_packages[$package_nevra]+present} ]] || candidate=1
+        for managed in "${KERNEL_PACKAGES[@]}"; do
+            [[ $package_name != "$managed" ]] || candidate=1
+        done
+        ((candidate)) || continue
+        kernel_removals+=("$package_nevra")
+        retired["$package_nevra"]=1
+    done <<<"$inventory"
+    switch_removals=("${kernel_removals[@]}")
+    ((${#kernel_removals[@]})) || return 0
+
+    provides=$(sudo rpm -q --provides "${kernel_removals[@]}") ||
+        die "could not read the kernels being retired"
+    while IFS= read -r dependency; do
+        [[ $dependency == 'kernel-uname-r = '* ]] || continue
+        kernel_version=${dependency#'kernel-uname-r = '}
+        [[ $kernel_version =~ ^[[:alnum:]_.+~-]+$ ]] ||
+            die "invalid kernel version in RPM metadata"
+        retired_kernels["$kernel_version"]=1
+    done <<<"$provides"
+
+    for kernel_version in "${!retired_kernels[@]}"; do
+        providers=$(sudo rpm -q --whatprovides "kernel-uname-r = $kernel_version" \
+            --qf '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n') ||
+            die "could not identify installed providers for $kernel_version"
+        [[ -n $providers ]] || die "empty kernel provider inventory for $kernel_version"
+        while IFS= read -r provider; do
+            if [[ -z ${retired[$provider]+present} ]]; then
+                unset 'retired_kernels[$kernel_version]'
+                break
+            fi
+        done <<<"$providers"
+    done
+
+    while IFS=$'\t' read -r package_name package_nevra; do
+        [[ $package_name == kmod-* && -n $package_nevra ]] || continue
+        for kernel_version in "${!retired_kernels[@]}"; do
+            [[ $package_name == kmod-?*-"$kernel_version" ]] || continue
+            requirements=$(sudo rpm -q --requires "$package_nevra") ||
+                die "could not read module requirements for $package_nevra"
+            # Match both the generated package name and its exact kernel ABI.
+            if grep -Fqx "kernel-uname-r = $kernel_version" <<<"$requirements"; then
+                switch_removals+=("$package_nevra")
+                break
+            fi
+        done
+    done <<<"$inventory"
+}
+
 [[ $# -eq 2 ]] || {
     usage
     exit 2
@@ -369,7 +437,7 @@ case "${action}:${kernel_flavor}" in
         ;;
 esac
 
-for command_name in dnf rpm sudo sed grep dracut update-grub; do
+for command_name in dnf5 rpm sudo sed grep dracut update-grub; do
     command -v "$command_name" >/dev/null 2>&1 ||
         die "required command not found: ${command_name}"
 done
@@ -383,7 +451,7 @@ grep -Fqx "[${disabled_repo_id}]" "$disabled_source" ||
     die "${disabled_source} does not define [${disabled_repo_id}]"
 
 # Cache the exact installed NEVRAs before changing the repo-file layout.
-if ! installed_output=$(dnf -q repoquery \
+if ! installed_output=$(dnf5 -q repoquery \
     --installed \
     --installed-from-repo="$disabled_repo_id" \
     --queryformat='%{full_nevra}\n'); then
@@ -419,10 +487,10 @@ printf 'Selected the %s kernel and disabled the %s kernel source.\n' \
 
 # Confirm that the selected source is usable and contains every managed package
 # before removing any installed kernel packages.
-sudo dnf -y --refresh --repo="$enabled_repo_id" makecache
+sudo dnf5 -y --refresh --repo="$enabled_repo_id" makecache
 
 for package_name in "${KERNEL_PACKAGES[@]}"; do
-    if ! available_output=$(sudo dnf -q --repo="$enabled_repo_id" repoquery \
+    if ! available_output=$(sudo dnf5 -q --repo="$enabled_repo_id" repoquery \
         --available \
         --latest-limit=1 \
         --queryformat='%{full_nevra}\n' \
@@ -431,33 +499,17 @@ for package_name in "${KERNEL_PACKAGES[@]}"; do
     fi
 done
 
-if ((${#disabled_packages[@]})); then
-    printf 'Removing packages installed from %s:\n' "$disabled_repo_id"
-    for package_nevra in "${disabled_packages[@]}"; do
-        printf '  %s\n' "$package_nevra"
-        sudo rpm -e --nodeps "$package_nevra"
-    done
+switch_removals=()
+plan_kernel_removals
+if ((${#switch_removals[@]})); then
+    printf 'Removing retired kernel packages and their generated modules:\n'
+    printf '  %s\n' "${switch_removals[@]}"
+    # Keep the existing forced kernel-family replacement behavior, but erase
+    # the complete set together instead of leaving dangling kmod requirements.
+    sudo rpm -e --nodeps "${switch_removals[@]}"
 else
-    printf 'No installed packages were attributed to %s.\n' "$disabled_repo_id"
+    printf 'No previously installed managed kernel packages were found.\n'
 fi
-
-# Remove every installed version of each managed package for both switch
-# directions. Querying by name also catches packages recorded as @commandline.
-printf 'Purging all previously installed managed kernel packages.\n'
-
-for package_name in "${KERNEL_PACKAGES[@]}"; do
-    installed_nevras=()
-    if package_output=$(sudo rpm -q \
-        --qf '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' \
-        "$package_name" 2>/dev/null); then
-        mapfile -t installed_nevras <<<"$package_output"
-    fi
-
-    for package_nevra in "${installed_nevras[@]}"; do
-        printf '  %s\n' "$package_nevra"
-        sudo rpm -e --nodeps "$package_nevra"
-    done
-done
 
 for package_name in "${KERNEL_PACKAGES[@]}"; do
     if sudo rpm -q "$package_name" >/dev/null 2>&1; then
@@ -469,12 +521,12 @@ for package_name in "${KERNEL_PACKAGES[@]}"; do
     if sudo rpm -q "$package_name" >/dev/null 2>&1; then
         printf 'Upgrading installed package %s from %s.\n' \
             "$package_name" "$enabled_repo_id"
-        sudo dnf -y --best upgrade \
+        sudo dnf5 -y --best upgrade \
             --from-repo="$enabled_repo_id" "$package_name"
     else
         printf 'Installing missing package %s from %s.\n' \
             "$package_name" "$enabled_repo_id"
-        sudo dnf -y --best install \
+        sudo dnf5 -y --best install \
             --from-repo="$enabled_repo_id" "$package_name"
     fi
 done
