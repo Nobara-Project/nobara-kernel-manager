@@ -35,12 +35,15 @@ if name == 'rpm':
     if '--whatprovides' in args:
         if s.get('fail') == 'providers': done(status=1)
         dep = args[args.index('--whatprovides') + 1]
-        found = [v for v in s['packages'] if dep in v['provides']]
+        # RPM selects by capability name; it does not resolve versioned expressions.
+        found = [v for v in s['packages'] if any(dep == item.split(' ', 1)[0] for item in v['provides'])]
         done('\n'.join(v['nevra'] for v in found), 0 if found else 1)
     if '--provides' in args or '--requires' in args:
         field = 'provides' if '--provides' in args else 'requires'
         if s.get('fail') == field: done(status=1)
         found = selected(args[args.index('--' + field) + 1:])
+        if s.get('fail') == 'retained-provides' and any(v['name'] == 'custom-boot-kernel' for v in found):
+            done(status=1)
         done('\n'.join(dep for v in found for dep in v[field]), 0 if found else 1)
     if '-e' in args:
         removed = args[args.index('--nodeps') + 1:]
@@ -74,11 +77,11 @@ def package(name, *, version='1', origin='nobara-kernel-lts', provides=(), requi
 
 
 class KernelSwitchTests(unittest.TestCase):
-    def run_switch(self, *, target='mainline', extra=(), fail=None):
+    def run_switch(self, *, target='mainline', extra=(), fail=None, core_provides=True, already_selected=False):
         old_repo = 'nobara-kernel-' + ('lts' if target == 'mainline' else 'mainline')
         kernel = '6.18.52-201.lts.nobara.fc44.noarch' if target == 'mainline' else '7.2.4-201.nobara.fc44.noarch'
         dependency = 'kernel-uname-r = ' + kernel
-        old = [package(name, origin=old_repo, provides=[dependency] if name == 'kernel-core' else []) for name in MANAGED]
+        old = [package(name, origin=old_repo, provides=[dependency] if name == 'kernel-core' and core_provides else []) for name in MANAGED]
         modules = [package(f'kmod-{driver}-{kernel}', origin='@commandline', requires=[dependency])
                    for driver in ('wl', 'v4l2loopback')]
         # Preserve source/metapackages even with misleading repository origins.
@@ -90,9 +93,10 @@ class KernelSwitchTests(unittest.TestCase):
             disabled = repos / 'no-touch-disabled'
             disabled.mkdir(parents=True)
             for family in ('mainline', 'lts'):
-                enabled = family != target
+                enabled = (family == target) if already_selected else (family != target)
                 path = (repos if enabled else disabled) / f'nobara-kernel-{family}.repo'
                 path.write_text(f'[nobara-kernel-{family}]\nname=Fixture\nenabled={int(enabled)}\n')
+            initial_repos = {str(p.relative_to(repos)): p.read_bytes() for p in repos.rglob('*.repo')}
             script = root / 'kernel-manager'
             script.write_text(SOURCE.read_text().replace('readonly REPO_DIR="/etc/yum.repos.d"', f'readonly REPO_DIR="{repos}"'))
             bins = root / 'bin'
@@ -107,7 +111,13 @@ class KernelSwitchTests(unittest.TestCase):
                                     env=dict(os.environ, PATH=str(bins) + ':' + os.environ['PATH'], SWITCH_FIXTURE=str(state)))
             calls = [json.loads(line) for line in state.with_suffix('.log').read_text().splitlines()]
             final = json.loads(state.read_text())['packages']
-            selected_repo = (repos / f'nobara-kernel-{target}.repo').read_text()
+            final_repos = {str(p.relative_to(repos)): p.read_bytes() for p in repos.rglob('*.repo')}
+            if fail in ('inventory', 'provides', 'providers', 'requires', 'retained-provides'):
+                self.assertEqual(final_repos, initial_repos, 'RPM inventory failure changed repository configuration')
+            selected_path = repos / f'nobara-kernel-{target}.repo'
+            if not selected_path.exists():
+                selected_path = disabled / selected_path.name
+            selected_repo = selected_path.read_text()
             return result, calls, final, old + modules, sources + [other], selected_repo
 
     def test_both_switch_directions_remove_matching_modules_with_kernels(self):
@@ -132,6 +142,36 @@ class KernelSwitchTests(unittest.TestCase):
         retained = {v['nevra'] for v in final}
         self.assertTrue({v['nevra'] for v in retired if v['name'].startswith('kmod-')} <= retained)
         self.assertIn(extra['nevra'], retained)
+
+    def test_retry_after_old_failure_already_changed_repositories(self):
+        for target in ('mainline', 'lts'):
+            with self.subTest(target=target):
+                result, _, final, retired, _, repo = self.run_switch(target=target, already_selected=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse({v['nevra'] for v in retired} & {v['nevra'] for v in final})
+                self.assertIn('enabled=1', repo)
+
+    def test_retained_provider_for_another_kernel_does_not_keep_retired_modules(self):
+        extra = package('custom-boot-kernel', origin='@commandline', provides=['kernel-uname-r = 5.0-1.noarch'])
+        result, _, final, retired, _, _ = self.run_switch(extra=[extra])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        retained = {v['nevra'] for v in final}
+        self.assertFalse({v['nevra'] for v in retired} & retained)
+        self.assertIn(extra['nevra'], retained)
+
+    def test_no_kernel_abi_provider_needs_no_provider_lookup(self):
+        result, calls, final, retired, _, _ = self.run_switch(core_provides=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(any('--whatprovides' in c for c in calls))
+        self.assertTrue({v['nevra'] for v in retired if v['name'].startswith('kmod-')} <= {v['nevra'] for v in final})
+
+    def test_unreadable_retained_provider_stops_before_changing_repos_or_packages(self):
+        extra = package('custom-boot-kernel', origin='@commandline', provides=['kernel-uname-r = 5.0-1.noarch'])
+        result, calls, final, retired, _, _ = self.run_switch(extra=[extra], fail='retained-provides')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('could not read retained kernel provider', result.stderr)
+        self.assertFalse(any(c[:2] == ['rpm', '-e'] for c in calls))
+        self.assertTrue({v['nevra'] for v in retired} <= {v['nevra'] for v in final})
 
     def test_matching_name_without_matching_kernel_requirement_is_preserved(self):
         name = 'kmod-custom-6.18.52-201.lts.nobara.fc44.noarch'

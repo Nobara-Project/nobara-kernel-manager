@@ -23,9 +23,10 @@ installing the latest packages from the selected Nobara kernel source. The remov
 plan includes generated per-kernel module RPMs whose exact kernel is being
 retired, including locally built akmods packages. Driver sources, generic module
 packages, and modules whose kernel still has an installed provider are retained.
-All RPM inventory checks finish before any package is erased. DNF operations use
-DNF5 explicitly. Rescue
-reinstallation uses the newest bootable kernel matching the enabled Nobara
+Kernel providers are queried by capability name and matched against their exact
+kernel ABI, including providers with a different package name. All RPM inventory
+checks finish before repository settings change or any package is erased. DNF
+operations use DNF5 explicitly. Rescue reinstallation uses the newest bootable kernel matching the enabled Nobara
 kernel source, builds a strict host-only initramfs, excludes external modules,
 uses basic graphics mode, and keeps the rescue entry last in GRUB.
 
@@ -58,4 +59,7 @@ python3 -B -m unittest discover -s tests -v
 The tests run the switch script with disposable repository files and simulated
 RPM/DNF commands. They cover both switch directions, exact module matching,
 retained kernel providers, and failures before removal; host packages and boot
-files are never changed.
+files are never changed. When `rpm` and `rpmbuild` are available, additional tests
+build header-only packages in a temporary directory and verify provider matching
+against a real, isolated RPM database. These catch differences between the
+simulated queries and RPM's actual capability lookup behavior.

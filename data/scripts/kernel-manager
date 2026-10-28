@@ -378,18 +378,27 @@ plan_kernel_removals() {
         retired_kernels["$kernel_version"]=1
     done <<<"$provides"
 
-    for kernel_version in "${!retired_kernels[@]}"; do
-        providers=$(sudo rpm -q --whatprovides "kernel-uname-r = $kernel_version" \
+    if ((${#retired_kernels[@]})); then
+        # rpm --whatprovides looks up capability names, not versioned
+        # dependency expressions. Query all providers, then inspect their
+        # exact provides before deciding whether an ABI will disappear.
+        providers=$(sudo rpm -q --whatprovides kernel-uname-r \
             --qf '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n') ||
-            die "could not identify installed providers for $kernel_version"
-        [[ -n $providers ]] || die "empty kernel provider inventory for $kernel_version"
+            die "could not identify installed kernel providers"
+        [[ -n $providers ]] || die "empty kernel provider inventory"
         while IFS= read -r provider; do
-            if [[ -z ${retired[$provider]+present} ]]; then
+            [[ -z ${retired[$provider]+present} ]] || continue
+            provides=$(sudo rpm -q --provides "$provider") ||
+                die "could not read retained kernel provider $provider"
+            while IFS= read -r dependency; do
+                [[ $dependency == 'kernel-uname-r = '* ]] || continue
+                kernel_version=${dependency#'kernel-uname-r = '}
+                [[ $kernel_version =~ ^[[:alnum:]_.+~-]+$ ]] ||
+                    die "invalid kernel version in RPM metadata"
                 unset 'retired_kernels[$kernel_version]'
-                break
-            fi
+            done <<<"$provides"
         done <<<"$providers"
-    done
+    fi
 
     while IFS=$'\t' read -r package_name package_nevra; do
         [[ $package_name == kmod-* && -n $package_nevra ]] || continue
@@ -464,6 +473,9 @@ if [[ -n "$installed_output" ]]; then
 fi
 
 sudo -v
+switch_removals=()
+plan_kernel_removals
+
 sudo install -d -m 0755 "$DISABLED_DIR"
 
 # Change enabled= while each file is still at its known source path. The repo
@@ -499,8 +511,6 @@ for package_name in "${KERNEL_PACKAGES[@]}"; do
     fi
 done
 
-switch_removals=()
-plan_kernel_removals
 if ((${#switch_removals[@]})); then
     printf 'Removing retired kernel packages and their generated modules:\n'
     printf '  %s\n' "${switch_removals[@]}"
