@@ -77,7 +77,8 @@ def package(name, *, version='1', origin='nobara-kernel-lts', provides=(), requi
 
 
 class KernelSwitchTests(unittest.TestCase):
-    def run_switch(self, *, target='mainline', extra=(), fail=None, core_provides=True, already_selected=False):
+    def run_switch(self, *, target='mainline', extra=(), fail=None, core_provides=True, already_selected=False,
+                   reset=False):
         old_repo = 'nobara-kernel-' + ('lts' if target == 'mainline' else 'mainline')
         kernel = '6.18.52-201.lts.nobara.fc44.noarch' if target == 'mainline' else '7.2.4-201.nobara.fc44.noarch'
         dependency = 'kernel-uname-r = ' + kernel
@@ -96,9 +97,22 @@ class KernelSwitchTests(unittest.TestCase):
                 enabled = (family == target) if already_selected else (family != target)
                 path = (repos if enabled else disabled) / f'nobara-kernel-{family}.repo'
                 path.write_text(f'[nobara-kernel-{family}]\nname=Fixture\nenabled={int(enabled)}\n')
+            if reset:
+                # An LTS system after an older nobara-repos upgrade: its packaged
+                # Mainline file is back next to the copy moved aside for LTS,
+                # and the reset LTS file was moved aside as disabled.
+                for path in repos.rglob('*.repo'):
+                    path.unlink()
+                for family in ('mainline', 'lts'):
+                    (disabled / f'nobara-kernel-{family}.repo').write_text(f'[nobara-kernel-{family}]\nname=Fixture\nenabled=0\n')
+                (repos / 'nobara-kernel-mainline.repo').write_text('[nobara-kernel-mainline]\nname=Packaged\nenabled=1\n')
             initial_repos = {str(p.relative_to(repos)): p.read_bytes() for p in repos.rglob('*.repo')}
             script = root / 'kernel-manager'
-            script.write_text(SOURCE.read_text().replace('readonly REPO_DIR="/etc/yum.repos.d"', f'readonly REPO_DIR="{repos}"'))
+            family_state = root / 'nobara/kernel-family'
+            script.write_text(SOURCE.read_text()
+                              .replace('readonly REPO_DIR="/etc/yum.repos.d"', f'readonly REPO_DIR="{repos}"')
+                              .replace('readonly FAMILY_STATE="/etc/nobara/kernel-family"',
+                                       f'readonly FAMILY_STATE="{family_state}"'))
             bins = root / 'bin'
             bins.mkdir()
             for command in ('sudo', 'rpm', 'dnf5', 'dracut', 'update-grub'):
@@ -118,6 +132,8 @@ class KernelSwitchTests(unittest.TestCase):
             if not selected_path.exists():
                 selected_path = disabled / selected_path.name
             selected_repo = selected_path.read_text()
+            self.layout = {str(p.relative_to(repos)): p.read_text() for p in repos.rglob('*.repo')}
+            self.family = family_state.read_text() if family_state.exists() else None
             return result, calls, final, old + modules, sources + [other], selected_repo
 
     def test_both_switch_directions_remove_matching_modules_with_kernels(self):
@@ -133,6 +149,28 @@ class KernelSwitchTests(unittest.TestCase):
                 self.assertEqual(len([v for v in final if v['name'] in MANAGED]), len(MANAGED))
                 erase_index = calls.index(erases[0])
                 self.assertTrue(any('makecache' in c for c in calls[:erase_index]))
+
+    def test_switch_records_the_selected_family(self):
+        for target in ('mainline', 'lts'):
+            with self.subTest(target=target):
+                result, *_ = self.run_switch(target=target)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.family, target + '\n')
+
+    def test_lts_switch_repairs_layout_reset_by_repository_upgrade(self):
+        result, calls, final, retired, _, repo = self.run_switch(target='lts', reset=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(set(self.layout), {'nobara-kernel-lts.repo', 'no-touch-disabled/nobara-kernel-mainline.repo'})
+        self.assertIn('enabled=1', self.layout['nobara-kernel-lts.repo'])
+        # The packaged Mainline copy replaces the stale moved-aside one.
+        self.assertIn('name=Packaged\nenabled=0', self.layout['no-touch-disabled/nobara-kernel-mainline.repo'])
+        self.assertEqual(self.family, 'lts\n')
+
+    def test_mainline_switch_on_reset_layout_drops_stale_copy(self):
+        result, *_ = self.run_switch(target='mainline', reset=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(set(self.layout), {'nobara-kernel-mainline.repo', 'no-touch-disabled/nobara-kernel-lts.repo'})
+        self.assertIn('name=Packaged', self.layout['nobara-kernel-mainline.repo'])
 
     def test_shared_kernel_provider_keeps_its_modules(self):
         kernel = '6.18.52-201.lts.nobara.fc44.noarch'

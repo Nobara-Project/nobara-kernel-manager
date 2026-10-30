@@ -14,6 +14,11 @@ and remains licensed under MPL-2.0.
   Mainline and LTS kernel versions.
 - Disables the button for the installed Nobara kernel family.
 - Disables both switching buttons when any third-party kernel entry is present.
+- Offers **Keep Mainline** and **Keep LTS** when both Nobara kernel families are
+  installed; either one removes the other family's kernels.
+- Records the selected family in `/etc/nobara/kernel-family`. `nobara-repos`
+  upgrades restore that selection, and the updater does not install kernels
+  from the other family's repository.
 - Leaves **Reinstall Rescue Kernel** available regardless of kernel detection.
 - Runs all kernel-changing operations through PolicyKit and the bundled
   `kernel-manager` backend.

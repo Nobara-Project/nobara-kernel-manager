@@ -550,9 +550,14 @@ fn apply_kernel_state(controls: &Controls, state: KernelState) {
                 .status
                 .set_label("Multiple Nobara kernel families detected");
             controls.detail.set_label(
-                "Both Mainline and LTS GRUB entries are installed. Kernel switching is disabled until only one family remains.",
+                "Both Mainline and LTS kernels are installed. Choose the family to keep; the other family's kernels will be removed.",
             );
-            disable_switch_buttons(controls);
+            // A switch removes every managed kernel before installing the
+            // selected family, so it is also the repair for a mixed system.
+            controls.mainline.set_sensitive(true);
+            controls.mainline.set_label("Keep Mainline");
+            controls.lts.set_sensitive(true);
+            controls.lts.set_label("Keep LTS");
         }
         KernelState::Unknown(error) => {
             controls

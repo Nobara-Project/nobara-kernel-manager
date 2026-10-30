@@ -6,6 +6,8 @@ readonly REPO_DIR="/etc/yum.repos.d"
 readonly DISABLED_DIR="${REPO_DIR}/no-touch-disabled"
 readonly MAINLINE_FILE="nobara-kernel-mainline.repo"
 readonly LTS_FILE="nobara-kernel-lts.repo"
+# nobara-repos restores this selection when its upgrades reset the repo files.
+readonly FAMILY_STATE="/etc/nobara/kernel-family"
 
 readonly -a KERNEL_PACKAGES=(
     kernel-modules
@@ -32,9 +34,9 @@ repo_file_location() {
     local active_path="${REPO_DIR}/${filename}"
     local disabled_path="${DISABLED_DIR}/${filename}"
 
-    if [[ -e "$active_path" && -e "$disabled_path" ]]; then
-        die "${filename} exists in both repository directories"
-    elif [[ -f "$active_path" ]]; then
+    # Older nobara-repos upgrades restored the packaged file next to the copy
+    # moved aside here. The packaged copy is current; the switch drops the other.
+    if [[ -f "$active_path" ]]; then
         printf '%s\n' "$active_path"
     elif [[ -f "$disabled_path" ]]; then
         printf '%s\n' "$disabled_path"
@@ -487,11 +489,16 @@ disabled_destination="${DISABLED_DIR}/${disabled_filename}"
 enabled_destination="${REPO_DIR}/${enabled_filename}"
 
 if [[ "$disabled_source" != "$disabled_destination" ]]; then
-    sudo mv "$disabled_source" "$disabled_destination"
+    sudo mv -f "$disabled_source" "$disabled_destination"
 fi
 if [[ "$enabled_source" != "$enabled_destination" ]]; then
-    sudo mv "$enabled_source" "$enabled_destination"
+    sudo mv -f "$enabled_source" "$enabled_destination"
+else
+    sudo rm -f "${DISABLED_DIR}/${enabled_filename}"
 fi
+
+sudo install -d -m 0755 "${FAMILY_STATE%/*}"
+printf '%s\n' "$kernel_flavor" | sudo tee "$FAMILY_STATE" >/dev/null
 
 printf 'Selected the %s kernel and disabled the %s kernel source.\n' \
     "$kernel_flavor" \
