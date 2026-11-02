@@ -11,6 +11,7 @@ import unittest
 
 SOURCE = Path(__file__).resolve().parents[1] / 'data/scripts/kernel-manager'
 MANAGED = ('kernel-modules', 'kernel-core', 'kernel-devel', 'kernel-devel-matched', 'kernel-headers', 'kernel')
+EAC = ('kernel-eac-modules', 'kernel-eac-core', 'kernel-eac-devel', 'kernel-eac-devel-matched', 'kernel-eac')
 
 FAKE = r'''#!/usr/bin/env python3
 import json, os, sys
@@ -217,6 +218,30 @@ class KernelSwitchTests(unittest.TestCase):
         result, _, final, _, _, _ = self.run_switch(extra=[extra])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(extra['nevra'], {v['nevra'] for v in final})
+
+    def test_eac_kernel_is_replaced_with_the_selected_family(self):
+        for target in ('mainline', 'lts'):
+            with self.subTest(target=target):
+                old_repo = 'nobara-kernel-' + ('lts' if target == 'mainline' else 'mainline')
+                kernel = ('6.18.52-201.lts.eac.nobara.fc44.noarch' if target == 'mainline'
+                          else '7.2.4-201.eac.nobara.fc44.noarch')
+                dependency = 'kernel-uname-r = ' + kernel
+                eac = [package(name, origin=old_repo, provides=[dependency] if name == 'kernel-eac-core' else [])
+                       for name in EAC]
+                signed = package(f'kmod-xone-signed-{kernel}', origin=old_repo, requires=[dependency, 'xone'])
+                result, calls, final, *_ = self.run_switch(target=target, extra=eac + [signed])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                erases = [c for c in calls if c[:2] == ['rpm', '-e']]
+                self.assertEqual(len(erases), 1)
+                self.assertTrue({v['nevra'] for v in eac + [signed]} <= set(erases[0][3:]))
+                installed = {v['name'] for v in final if v['origin'] == 'selected'}
+                self.assertTrue(set(EAC) <= installed)
+                self.assertNotIn(signed['nevra'], {v['nevra'] for v in final})
+
+    def test_no_eac_kernel_installs_none(self):
+        result, calls, final, *_ = self.run_switch()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(any(v['name'] in EAC for v in final))
 
     def test_query_or_repository_failure_stops_before_removal(self):
         for fail in ('inventory', 'provides', 'providers', 'requires', 'metadata', 'available'):

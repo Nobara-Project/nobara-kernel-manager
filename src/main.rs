@@ -721,7 +721,8 @@ fn classify_entries(entries: &[BootEntry]) -> KernelState {
         if !entry.linux.contains("vmlinuz") && !entry.linux.ends_with("/linux") {
             continue;
         }
-        if version.contains(".lts.nobara.") {
+        // Easy Anti-Cheat kernels: <version>-<release>[.lts].eac.nobara.<dist>
+        if version.contains(".lts.nobara.") || version.contains(".lts.eac.nobara.") {
             has_lts = true;
         } else if version.contains(".nobara.") {
             has_mainline = true;
@@ -779,6 +780,20 @@ mod tests {
     fn detects_lts() {
         let entries = vec![entry("Nobara Linux", "6.18.42-200.lts.nobara.fc44.x86_64")];
         assert_eq!(classify_entries(&entries), KernelState::Lts);
+    }
+
+    #[test]
+    fn classifies_eac_kernels_with_their_family() {
+        let lts = vec![
+            entry("Nobara Linux", "6.18.55-201.lts.nobara.fc44.x86_64"),
+            entry("[EAC] Nobara Linux", "6.18.55-201.lts.eac.nobara.fc44.x86_64"),
+        ];
+        assert_eq!(classify_entries(&lts), KernelState::Lts);
+        let mainline = vec![
+            entry("Nobara Linux", "7.3.0-204.nobara.fc44.x86_64"),
+            entry("[EAC] Nobara Linux", "7.3.0-204.eac.nobara.fc44.x86_64"),
+        ];
+        assert_eq!(classify_entries(&mainline), KernelState::Mainline);
     }
 
     #[test]

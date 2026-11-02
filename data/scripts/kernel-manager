@@ -18,6 +18,17 @@ readonly -a KERNEL_PACKAGES=(
     kernel
 )
 
+# The Easy Anti-Cheat kernel (nobara-eac). It is optional: a switch replaces
+# the installed packages with the selected family's, and their signed module
+# packages (kmod-*-signed-<kernel>) come with it.
+readonly -a EAC_PACKAGES=(
+    kernel-eac-modules
+    kernel-eac-core
+    kernel-eac-devel
+    kernel-eac-devel-matched
+    kernel-eac
+)
+
 usage() {
     printf 'Usage:\n' >&2
     printf '  %s switch {mainline|lts}\n' "${0##*/}" >&2
@@ -87,6 +98,7 @@ select_rescue_kernel() {
     local newest
     local -a usable_versions=()
     local -a family_versions=()
+    local -a eac_versions=()
 
     family=$(enabled_kernel_family)
 
@@ -99,6 +111,12 @@ select_rescue_kernel() {
         [[ $version != 0-rescue* ]] || continue
         [[ -f "/usr/lib/modules/${version}/vmlinuz" ]] || continue
 
+        # Prefer the normal kernel: the EAC kernel's entry carries the EAC
+        # command line (lockdown, enforced module signatures)
+        if [[ $version == *.eac.nobara.* ]]; then
+            eac_versions+=("$version")
+            continue
+        fi
         usable_versions+=("$version")
         case "$family:$version" in
             lts:*.lts.nobara.*)
@@ -110,6 +128,22 @@ select_rescue_kernel() {
                 ;;
         esac
     done
+
+    # Only EAC kernels: use them
+    if ((${#usable_versions[@]} == 0)); then
+        for version in "${eac_versions[@]}"; do
+            usable_versions+=("$version")
+            case "$family:$version" in
+                lts:*.lts.eac.nobara.*)
+                    family_versions+=("$version")
+                    ;;
+                mainline:*.eac.nobara.*)
+                    [[ $version == *.lts.eac.nobara.* ]] ||
+                        family_versions+=("$version")
+                    ;;
+            esac
+        done
+    fi
 
     if [[ -n $family ]]; then
         ((${#family_versions[@]})) ||
@@ -360,7 +394,7 @@ plan_kernel_removals() {
         case "$package_name" in kernel|kernel-*) ;; *) continue ;; esac
         candidate=0
         [[ -z ${repository_packages[$package_nevra]+present} ]] || candidate=1
-        for managed in "${KERNEL_PACKAGES[@]}"; do
+        for managed in "${KERNEL_PACKAGES[@]}" "${EAC_PACKAGES[@]}"; do
             [[ $package_name != "$managed" ]] || candidate=1
         done
         ((candidate)) || continue
@@ -474,6 +508,14 @@ if [[ -n "$installed_output" ]]; then
     mapfile -t disabled_packages <<<"$installed_output"
 fi
 
+# The EAC kernel packages to install again from the selected source
+eac_packages=()
+for package_name in "${EAC_PACKAGES[@]}"; do
+    if sudo rpm -q "$package_name" >/dev/null 2>&1; then
+        eac_packages+=("$package_name")
+    fi
+done
+
 sudo -v
 switch_removals=()
 plan_kernel_removals
@@ -508,7 +550,7 @@ printf 'Selected the %s kernel and disabled the %s kernel source.\n' \
 # before removing any installed kernel packages.
 sudo dnf5 -y --refresh --repo="$enabled_repo_id" makecache
 
-for package_name in "${KERNEL_PACKAGES[@]}"; do
+for package_name in "${KERNEL_PACKAGES[@]}" "${eac_packages[@]}"; do
     if ! available_output=$(sudo dnf5 -q --repo="$enabled_repo_id" repoquery \
         --available \
         --latest-limit=1 \
@@ -528,13 +570,13 @@ else
     printf 'No previously installed managed kernel packages were found.\n'
 fi
 
-for package_name in "${KERNEL_PACKAGES[@]}"; do
+for package_name in "${KERNEL_PACKAGES[@]}" "${EAC_PACKAGES[@]}"; do
     if sudo rpm -q "$package_name" >/dev/null 2>&1; then
         die "${package_name} is still installed after the kernel purge"
     fi
 done
 
-for package_name in "${KERNEL_PACKAGES[@]}"; do
+for package_name in "${KERNEL_PACKAGES[@]}" "${eac_packages[@]}"; do
     if sudo rpm -q "$package_name" >/dev/null 2>&1; then
         printf 'Upgrading installed package %s from %s.\n' \
             "$package_name" "$enabled_repo_id"
@@ -548,7 +590,14 @@ for package_name in "${KERNEL_PACKAGES[@]}"; do
     fi
 done
 
-for package_name in "${KERNEL_PACKAGES[@]}"; do
+# The signed modules of the EAC kernel come as weak dependencies; install
+# any that were skipped
+if ((${#eac_packages[@]})) && [[ -x /usr/bin/nobara-eac-kmods ]]; then
+    sudo /usr/bin/nobara-eac-kmods ||
+        printf 'Some signed modules are not available yet for the EAC kernel; it stays off the default entry until they are.\n'
+fi
+
+for package_name in "${KERNEL_PACKAGES[@]}" "${eac_packages[@]}"; do
     installed_nevras=()
     if package_output=$(sudo rpm -q \
         --qf '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' \
