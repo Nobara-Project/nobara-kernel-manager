@@ -237,11 +237,18 @@ class KernelSwitchTests(unittest.TestCase):
                 installed = {v['name'] for v in final if v['origin'] == 'selected'}
                 self.assertTrue(set(EAC) <= installed)
                 self.assertNotIn(signed['nevra'], {v['nevra'] for v in final})
+                installs = [c for c in calls if c[0] == 'dnf5' and ('install' in c or 'upgrade' in c)]
+                self.assertTrue(installs)
+                self.assertFalse(any('--setopt=exclude_from_weak=kernel-eac' in c for c in installs))
 
     def test_no_eac_kernel_installs_none(self):
         result, calls, final, *_ = self.run_switch()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(any(v['name'] in EAC for v in final))
+        # kernel recommends kernel-eac: a system without it must not get it back
+        installs = [c for c in calls if c[0] == 'dnf5' and ('install' in c or 'upgrade' in c)]
+        self.assertTrue(installs)
+        self.assertTrue(all('--setopt=exclude_from_weak=kernel-eac' in c for c in installs))
 
     def test_query_or_repository_failure_stops_before_removal(self):
         for fail in ('inventory', 'provides', 'providers', 'requires', 'metadata', 'available'):

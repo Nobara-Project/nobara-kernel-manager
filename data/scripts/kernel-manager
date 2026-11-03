@@ -515,6 +515,13 @@ for package_name in "${EAC_PACKAGES[@]}"; do
         eac_packages+=("$package_name")
     fi
 done
+# kernel recommends kernel-eac. Without an EAC kernel now, the user removed it:
+# keep it out. (dnf only does that by itself while a kernel that recommends it
+# is installed, and the switch removes them all first.)
+install_options=()
+if ((${#eac_packages[@]} == 0)); then
+    install_options+=(--setopt=exclude_from_weak=kernel-eac)
+fi
 
 sudo -v
 switch_removals=()
@@ -580,12 +587,12 @@ for package_name in "${KERNEL_PACKAGES[@]}" "${eac_packages[@]}"; do
     if sudo rpm -q "$package_name" >/dev/null 2>&1; then
         printf 'Upgrading installed package %s from %s.\n' \
             "$package_name" "$enabled_repo_id"
-        sudo dnf5 -y --best upgrade \
+        sudo dnf5 -y --best "${install_options[@]}" upgrade \
             --from-repo="$enabled_repo_id" "$package_name"
     else
         printf 'Installing missing package %s from %s.\n' \
             "$package_name" "$enabled_repo_id"
-        sudo dnf5 -y --best install \
+        sudo dnf5 -y --best "${install_options[@]}" install \
             --from-repo="$enabled_repo_id" "$package_name"
     fi
 done

@@ -20,6 +20,15 @@ and remains licensed under MPL-2.0.
   upgrades restore that selection, and the updater does not install kernels
   from the other family's repository.
 - Leaves **Reinstall Rescue Kernel** available regardless of kernel detection.
+- Counts the Easy Anti-Cheat kernel (`kernel-eac`, versions `*.eac.nobara.*`
+  and `*.lts.eac.nobara.*`) as part of its Mainline or LTS family. A switch
+  replaces an installed `kernel-eac` with the selected family's, together
+  with its Nobara-signed module packages (`kmod-*-signed-<kernel>`), and then
+  runs `nobara-eac-kmods` if it is installed. On systems without `kernel-eac`
+  (the user removed it), the switch keeps it out, although `kernel`
+  recommends it.
+- Builds the rescue kernel from the normal kernel, and from `kernel-eac` only
+  when no normal kernel is installed.
 - Runs all kernel-changing operations through PolicyKit and the bundled
   `kernel-manager` backend.
 
